@@ -123,14 +123,14 @@ def load_faiss_index(dirpath: Path) -> Tuple[faiss.Index, List[Dict], List[str],
     return index, data["metadatas"], data["texts"], data["dim"]
 
 
-def build_index_from_pdfs(
+def build_index_from_files(
     index_name: str,
     uploaded_files: List,
     chunk_size: int,
     overlap: int,
     embedder: OllamaEmbeddings,
 ):
-    """PDF 파일들로부터 FAISS 인덱스 구축"""
+    """PDF/TXT 파일들로부터 FAISS 인덱스 구축"""
     texts = []
     metadatas = []
 
@@ -141,31 +141,49 @@ def build_index_from_pdfs(
         status_text.text(f"처리 중: {file.name} ({i+1}/{len(uploaded_files)})")
 
         try:
-            file_bytes = file.read()
-            text, pdf_metadata = load_pdf_text(file_bytes, file.name)
+            filename = file.name
+            extension = Path(filename).suffix.lower()
+
+            if extension == ".pdf":
+                file_bytes = file.read()
+                text, source_metadata = load_pdf_text(file_bytes, filename)
+                page_info = f"{source_metadata['pages']}페이지"
+            elif extension == ".txt":
+                text = file.getvalue().decode("utf-8", errors="ignore")
+                text = clean_extracted_text(text)
+                source_metadata = {
+                    "title": filename,
+                    "author": "",
+                    "pages": 1,
+                    "encrypted": False,
+                }
+                page_info = "텍스트"
+            else:
+                st.warning(f"지원하지 않는 파일 형식입니다: {filename}")
+                continue
 
             if not text.strip():
-                st.warning(f"'{file.name}'에서 텍스트를 추출할 수 없습니다.")
+                st.warning(f"'{filename}'에서 텍스트를 추출할 수 없습니다.")
                 continue
 
             chunks = chunk_text(text, chunk_size=chunk_size, overlap=overlap)
 
-            st.info(f"📄 {file.name}: {pdf_metadata['pages']}페이지, {len(chunks)}개 청크 생성")
+            st.info(f"📄 {filename}: {page_info}, {len(chunks)}개 청크 생성")
 
             for j, chunk in enumerate(chunks):
                 texts.append(chunk)
                 metadatas.append({
-                    "source": file.name,
+                    "source": filename,
                     "chunk": j,
                     "chars": len(chunk),
                     "total_chunks": len(chunks),
-                    "pdf_pages": pdf_metadata["pages"],
-                    "pdf_title": pdf_metadata.get("title", ""),
-                    "pdf_author": pdf_metadata.get("author", ""),
+                    "pdf_pages": source_metadata["pages"],
+                    "pdf_title": source_metadata.get("title", ""),
+                    "pdf_author": source_metadata.get("author", ""),
                 })
 
         except Exception as e:
-            st.error(f"'{file.name}' 처리 중 오류: {e}")
+            st.error(f"'{filename}' 처리 중 오류: {e}")
             continue
 
         progress_bar.progress((i + 1) / len(uploaded_files))
@@ -399,10 +417,10 @@ def main():
                 overlap = st.number_input("오버랩", 0, 500, 200, 50)
 
             uploaded_files = st.file_uploader(
-                "PDF 파일 업로드",
-                type=["pdf"],
+                "PDF/TXT 파일 업로드",
+                type=["pdf", "txt"],
                 accept_multiple_files=True,
-                help="PDF 문서를 업로드하여 색인을 생성합니다.",
+                help="PDF 또는 TXT 문서를 업로드하여 색인을 생성합니다.",
             )
 
             if st.button("🔨 색인 생성") and uploaded_files:
@@ -411,8 +429,8 @@ def main():
                 else:
                     try:
                         ensure_embedder(embed_model, base_url)
-                        with st.spinner("PDF 처리 및 색인 생성 중..."):
-                            build_index_from_pdfs(
+                        with st.spinner("문서 처리 및 색인 생성 중..."):
+                            build_index_from_files(
                                 index_name,
                                 uploaded_files,
                                 chunk_size,
