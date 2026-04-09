@@ -94,6 +94,43 @@ def load_pdf_text(file_bytes: bytes, filename: str) -> Tuple[str, Dict]:
         return "", {"title": filename, "author": "", "pages": 0, "encrypted": False}
 
 
+def append_chunks(
+    texts: List[str],
+    metadatas: List[Dict],
+    text: str,
+    source: str,
+    source_metadata: Dict,
+    chunk_size: int,
+    overlap: int,
+    page_info: str,
+):
+    if not text.strip():
+        st.warning(f"'{source}'에서 텍스트를 추출할 수 없습니다.")
+        return
+
+    chunks = chunk_text(text, chunk_size=chunk_size, overlap=overlap)
+    st.info(f"📄 {source}: {page_info}, {len(chunks)}개 청크 생성")
+
+    for j, chunk in enumerate(chunks):
+        texts.append(chunk)
+        metadatas.append({
+            "source": source,
+            "chunk": j,
+            "chars": len(chunk),
+            "total_chunks": len(chunks),
+            "pdf_pages": source_metadata["pages"],
+            "pdf_title": source_metadata.get("title", ""),
+            "pdf_author": source_metadata.get("author", ""),
+        })
+
+
+def collect_folder_files(folder_path: str, include_subfolders: bool) -> List[Path]:
+    base = Path(folder_path)
+    if include_subfolders:
+        return [path for path in base.rglob("*") if path.is_file()]
+    return [path for path in base.iterdir() if path.is_file()]
+
+
 # ========= RAG 인덱스 관리 =========
 
 def get_index_dir(name: str) -> Path:
@@ -148,6 +185,7 @@ def build_index_from_files(
                 file_bytes = file.read()
                 text, source_metadata = load_pdf_text(file_bytes, filename)
                 page_info = f"{source_metadata['pages']}페이지"
+                append_chunks(texts, metadatas, text, filename, source_metadata, chunk_size, overlap, page_info)
             elif extension == ".txt":
                 text = file.getvalue().decode("utf-8", errors="ignore")
                 text = clean_extracted_text(text)
@@ -158,35 +196,84 @@ def build_index_from_files(
                     "encrypted": False,
                 }
                 page_info = "텍스트"
+                append_chunks(texts, metadatas, text, filename, source_metadata, chunk_size, overlap, page_info)
             else:
                 st.warning(f"지원하지 않는 파일 형식입니다: {filename}")
                 continue
-
-            if not text.strip():
-                st.warning(f"'{filename}'에서 텍스트를 추출할 수 없습니다.")
-                continue
-
-            chunks = chunk_text(text, chunk_size=chunk_size, overlap=overlap)
-
-            st.info(f"📄 {filename}: {page_info}, {len(chunks)}개 청크 생성")
-
-            for j, chunk in enumerate(chunks):
-                texts.append(chunk)
-                metadatas.append({
-                    "source": filename,
-                    "chunk": j,
-                    "chars": len(chunk),
-                    "total_chunks": len(chunks),
-                    "pdf_pages": source_metadata["pages"],
-                    "pdf_title": source_metadata.get("title", ""),
-                    "pdf_author": source_metadata.get("author", ""),
-                })
 
         except Exception as e:
             st.error(f"'{filename}' 처리 중 오류: {e}")
             continue
 
         progress_bar.progress((i + 1) / len(uploaded_files))
+
+    if not texts:
+        raise ValueError("처리할 수 있는 텍스트가 없습니다.")
+
+    status_text.text(f"임베딩 생성 중... (총 {len(texts)}개 청크)")
+    embeddings = embedder.embed_documents(texts)
+    embeddings = np.array(embeddings, dtype=np.float32)
+    embeddings = normalize_vectors(embeddings)
+
+    dim = embeddings.shape[1]
+    index = faiss.IndexFlatIP(dim)
+    index.add(embeddings)
+
+    save_faiss_index(get_index_dir(index_name), index, metadatas, texts, dim)
+
+    progress_bar.empty()
+    status_text.empty()
+
+    st.success(f"✅ 색인 생성 완료: {len(texts)}개 청크, {dim}차원 벡터")
+
+
+def build_index_from_folder(
+    index_name: str,
+    folder_path: str,
+    include_subfolders: bool,
+    chunk_size: int,
+    overlap: int,
+    embedder: OllamaEmbeddings,
+):
+    """폴더 내 PDF/TXT 파일로부터 FAISS 인덱스 구축"""
+    texts = []
+    metadatas = []
+
+    all_files = collect_folder_files(folder_path, include_subfolders)
+    target_files = [
+        path for path in all_files
+        if path.suffix.lower() in {".pdf", ".txt"}
+    ]
+
+    if not target_files:
+        raise ValueError("폴더에서 처리 가능한 PDF/TXT 파일을 찾지 못했습니다.")
+
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+
+    for i, path in enumerate(target_files):
+        status_text.text(f"처리 중: {path} ({i+1}/{len(target_files)})")
+        try:
+            if path.suffix.lower() == ".pdf":
+                file_bytes = path.read_bytes()
+                text, source_metadata = load_pdf_text(file_bytes, path.name)
+                page_info = f"{source_metadata['pages']}페이지"
+                append_chunks(texts, metadatas, text, str(path), source_metadata, chunk_size, overlap, page_info)
+            else:
+                text = path.read_text(encoding="utf-8", errors="ignore")
+                text = clean_extracted_text(text)
+                source_metadata = {
+                    "title": path.name,
+                    "author": "",
+                    "pages": 1,
+                    "encrypted": False,
+                }
+                page_info = "텍스트"
+                append_chunks(texts, metadatas, text, str(path), source_metadata, chunk_size, overlap, page_info)
+        except Exception as e:
+            st.error(f"'{path}' 처리 중 오류: {e}")
+            continue
+        progress_bar.progress((i + 1) / len(target_files))
 
     if not texts:
         raise ValueError("처리할 수 있는 텍스트가 없습니다.")
@@ -441,6 +528,33 @@ def main():
                         st.rerun()
                     except Exception as e:
                         st.error(f"❌ 색인 생성 실패: {e}")
+
+        with st.expander("🏢 NAS 폴더 색인", expanded=False):
+            folder_path = st.text_input("폴더 경로", "")
+            include_subfolders = st.checkbox("하위 폴더 포함", value=True)
+            st.caption("NAS 폴더가 이 서버에 마운트되어 있고 읽기 권한이 있어야 합니다.")
+
+            if st.button("📂 폴더 색인 생성"):
+                if not folder_path.strip():
+                    st.warning("폴더 경로를 입력해주세요.")
+                elif not Path(folder_path).exists():
+                    st.error("폴더 경로가 존재하지 않습니다.")
+                else:
+                    try:
+                        ensure_embedder(embed_model, base_url)
+                        with st.spinner("폴더 문서 처리 및 색인 생성 중..."):
+                            build_index_from_folder(
+                                index_name,
+                                folder_path,
+                                include_subfolders,
+                                chunk_size,
+                                overlap,
+                                st.session_state.embedder,
+                            )
+                        st.success(f"✅ 폴더 색인 생성 완료: {index_name}")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"❌ 폴더 색인 실패: {e}")
 
         existing_indices = [
             p.name
