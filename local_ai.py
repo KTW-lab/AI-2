@@ -3,6 +3,8 @@ import pickle
 import tempfile
 from pathlib import Path
 from typing import List, Dict, Tuple
+from datetime import datetime, timedelta
+import io
 
 import numpy as np
 import streamlit as st
@@ -10,6 +12,21 @@ import faiss
 import requests
 from langchain_ollama import OllamaLLM, OllamaEmbeddings
 from langchain_community.document_loaders import PyPDFLoader
+
+try:
+    import pandas as pd
+except Exception:
+    pd = None
+
+try:
+    from docx import Document
+except Exception:
+    Document = None
+
+try:
+    from pptx import Presentation
+except Exception:
+    Presentation = None
 
 # ========== 설정 ==========
 BASE_DIR = Path(__file__).resolve().parent
@@ -26,9 +43,13 @@ DEFAULT_TOP_K = 5
 DEFAULT_TEMPERATURE = 0.2
 DEFAULT_MAX_TOKENS = 512
 DEFAULT_OLLAMA_BASE_URL = "http://localhost:11434"
+DEFAULT_NAS_PATH = r"H:\생산기술실\HIMET\11.AI챗봇자료"
+DEFAULT_REINDEX_DAYS = 30
+
+SUPPORTED_EXTENSIONS = {".pdf", ".txt", ".docx", ".pptx", ".ppt", ".xls", ".xlsx"}
 
 st.set_page_config(
-    page_title="로컬 AI 모델 & PDF RAG 시스템 (Ollama)",
+    page_title="로컬 AI 모델 & 문서 RAG 시스템 (Ollama)",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -94,6 +115,32 @@ def load_pdf_text(file_bytes: bytes, filename: str) -> Tuple[str, Dict]:
         return "", {"title": filename, "author": "", "pages": 0, "encrypted": False}
 
 
+def load_docx_text(path: Path) -> str:
+    if Document is None:
+        raise RuntimeError("python-docx가 설치되지 않았습니다.")
+    doc = Document(str(path))
+    return clean_extracted_text("\n".join(p.text for p in doc.paragraphs if p.text))
+
+
+def load_pptx_text(path: Path) -> str:
+    if Presentation is None:
+        raise RuntimeError("python-pptx가 설치되지 않았습니다.")
+    presentation = Presentation(str(path))
+    lines = []
+    for slide in presentation.slides:
+        for shape in slide.shapes:
+            if hasattr(shape, "text") and shape.text:
+                lines.append(shape.text)
+    return clean_extracted_text("\n".join(lines))
+
+
+def load_excel_text(path: Path) -> str:
+    if pd is None:
+        raise RuntimeError("pandas가 설치되지 않았습니다.")
+    df = pd.read_excel(path)
+    return clean_extracted_text(df.to_string(index=False))
+
+
 def append_chunks(
     texts: List[str],
     metadatas: List[Dict],
@@ -131,6 +178,81 @@ def collect_folder_files(folder_path: str, include_subfolders: bool) -> List[Pat
     return [path for path in base.iterdir() if path.is_file()]
 
 
+def extract_text_from_upload(file) -> Tuple[str, Dict, str]:
+    filename = file.name
+    extension = Path(filename).suffix.lower()
+
+    if extension == ".pdf":
+        file_bytes = file.read()
+        text, source_metadata = load_pdf_text(file_bytes, filename)
+        page_info = f"{source_metadata['pages']}페이지"
+        return text, source_metadata, page_info
+
+    if extension == ".txt":
+        text = file.getvalue().decode("utf-8", errors="ignore")
+        text = clean_extracted_text(text)
+        source_metadata = {"title": filename, "author": "", "pages": 1, "encrypted": False}
+        return text, source_metadata, "텍스트"
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=extension) as tmp:
+        tmp.write(file.getvalue())
+        tmp_path = Path(tmp.name)
+
+    if extension == ".docx":
+        text = load_docx_text(tmp_path)
+        source_metadata = {"title": filename, "author": "", "pages": 1, "encrypted": False}
+        return text, source_metadata, "Word"
+
+    if extension in {".ppt", ".pptx"}:
+        if extension == ".ppt":
+            raise RuntimeError(".ppt 파일은 .pptx로 변환 후 업로드해주세요.")
+        text = load_pptx_text(tmp_path)
+        source_metadata = {"title": filename, "author": "", "pages": 1, "encrypted": False}
+        return text, source_metadata, "PPTX"
+
+    if extension in {".xls", ".xlsx"}:
+        text = load_excel_text(tmp_path)
+        source_metadata = {"title": filename, "author": "", "pages": 1, "encrypted": False}
+        return text, source_metadata, "엑셀"
+
+    raise RuntimeError(f"지원하지 않는 파일 형식입니다: {filename}")
+
+
+def extract_text_from_path(path: Path) -> Tuple[str, Dict, str]:
+    extension = path.suffix.lower()
+    filename = path.name
+
+    if extension == ".pdf":
+        file_bytes = path.read_bytes()
+        text, source_metadata = load_pdf_text(file_bytes, filename)
+        return text, source_metadata, f"{source_metadata['pages']}페이지"
+
+    if extension == ".txt":
+        text = path.read_text(encoding="utf-8", errors="ignore")
+        text = clean_extracted_text(text)
+        source_metadata = {"title": filename, "author": "", "pages": 1, "encrypted": False}
+        return text, source_metadata, "텍스트"
+
+    if extension == ".docx":
+        text = load_docx_text(path)
+        source_metadata = {"title": filename, "author": "", "pages": 1, "encrypted": False}
+        return text, source_metadata, "Word"
+
+    if extension in {".ppt", ".pptx"}:
+        if extension == ".ppt":
+            raise RuntimeError(".ppt 파일은 .pptx로 변환 후 사용해주세요.")
+        text = load_pptx_text(path)
+        source_metadata = {"title": filename, "author": "", "pages": 1, "encrypted": False}
+        return text, source_metadata, "PPTX"
+
+    if extension in {".xls", ".xlsx"}:
+        text = load_excel_text(path)
+        source_metadata = {"title": filename, "author": "", "pages": 1, "encrypted": False}
+        return text, source_metadata, "엑셀"
+
+    raise RuntimeError(f"지원하지 않는 파일 형식입니다: {filename}")
+
+
 # ========= RAG 인덱스 관리 =========
 
 def get_index_dir(name: str) -> Path:
@@ -147,17 +269,18 @@ def save_faiss_index(dirpath: Path, index: faiss.Index, metadatas: List[Dict], t
             "metadatas": metadatas,
             "texts": texts,
             "dim": dim,
+            "indexed_at": datetime.utcnow().isoformat(),
         }, f)
 
 
-def load_faiss_index(dirpath: Path) -> Tuple[faiss.Index, List[Dict], List[str], int]:
+def load_faiss_index(dirpath: Path) -> Tuple[faiss.Index, List[Dict], List[str], int, Dict]:
     """FAISS 인덱스와 메타데이터 로드"""
     index = faiss.read_index(str(dirpath / "index.faiss"))
 
     with open(dirpath / "meta.pkl", "rb") as f:
         data = pickle.load(f)
 
-    return index, data["metadatas"], data["texts"], data["dim"]
+    return index, data["metadatas"], data["texts"], data["dim"], data
 
 
 def build_index_from_files(
@@ -167,7 +290,7 @@ def build_index_from_files(
     overlap: int,
     embedder: OllamaEmbeddings,
 ):
-    """PDF/TXT 파일들로부터 FAISS 인덱스 구축"""
+    """업로드된 문서 파일들로부터 FAISS 인덱스 구축"""
     texts = []
     metadatas = []
 
@@ -178,31 +301,10 @@ def build_index_from_files(
         status_text.text(f"처리 중: {file.name} ({i+1}/{len(uploaded_files)})")
 
         try:
-            filename = file.name
-            extension = Path(filename).suffix.lower()
-
-            if extension == ".pdf":
-                file_bytes = file.read()
-                text, source_metadata = load_pdf_text(file_bytes, filename)
-                page_info = f"{source_metadata['pages']}페이지"
-                append_chunks(texts, metadatas, text, filename, source_metadata, chunk_size, overlap, page_info)
-            elif extension == ".txt":
-                text = file.getvalue().decode("utf-8", errors="ignore")
-                text = clean_extracted_text(text)
-                source_metadata = {
-                    "title": filename,
-                    "author": "",
-                    "pages": 1,
-                    "encrypted": False,
-                }
-                page_info = "텍스트"
-                append_chunks(texts, metadatas, text, filename, source_metadata, chunk_size, overlap, page_info)
-            else:
-                st.warning(f"지원하지 않는 파일 형식입니다: {filename}")
-                continue
-
+            text, source_metadata, page_info = extract_text_from_upload(file)
+            append_chunks(texts, metadatas, text, file.name, source_metadata, chunk_size, overlap, page_info)
         except Exception as e:
-            st.error(f"'{filename}' 처리 중 오류: {e}")
+            st.error(f"'{file.name}' 처리 중 오류: {e}")
             continue
 
         progress_bar.progress((i + 1) / len(uploaded_files))
@@ -235,18 +337,18 @@ def build_index_from_folder(
     overlap: int,
     embedder: OllamaEmbeddings,
 ):
-    """폴더 내 PDF/TXT 파일로부터 FAISS 인덱스 구축"""
+    """폴더 내 문서 파일로부터 FAISS 인덱스 구축"""
     texts = []
     metadatas = []
 
     all_files = collect_folder_files(folder_path, include_subfolders)
     target_files = [
         path for path in all_files
-        if path.suffix.lower() in {".pdf", ".txt"}
+        if path.suffix.lower() in SUPPORTED_EXTENSIONS
     ]
 
     if not target_files:
-        raise ValueError("폴더에서 처리 가능한 PDF/TXT 파일을 찾지 못했습니다.")
+        raise ValueError("폴더에서 처리 가능한 문서를 찾지 못했습니다.")
 
     progress_bar = st.progress(0)
     status_text = st.empty()
@@ -254,22 +356,8 @@ def build_index_from_folder(
     for i, path in enumerate(target_files):
         status_text.text(f"처리 중: {path} ({i+1}/{len(target_files)})")
         try:
-            if path.suffix.lower() == ".pdf":
-                file_bytes = path.read_bytes()
-                text, source_metadata = load_pdf_text(file_bytes, path.name)
-                page_info = f"{source_metadata['pages']}페이지"
-                append_chunks(texts, metadatas, text, str(path), source_metadata, chunk_size, overlap, page_info)
-            else:
-                text = path.read_text(encoding="utf-8", errors="ignore")
-                text = clean_extracted_text(text)
-                source_metadata = {
-                    "title": path.name,
-                    "author": "",
-                    "pages": 1,
-                    "encrypted": False,
-                }
-                page_info = "텍스트"
-                append_chunks(texts, metadatas, text, str(path), source_metadata, chunk_size, overlap, page_info)
+            text, source_metadata, page_info = extract_text_from_path(path)
+            append_chunks(texts, metadatas, text, str(path), source_metadata, chunk_size, overlap, page_info)
         except Exception as e:
             st.error(f"'{path}' 처리 중 오류: {e}")
             continue
@@ -299,7 +387,7 @@ def search_index(index_name: str, query: str, top_k: int, embedder: OllamaEmbedd
     """인덱스에서 관련 문서 검색"""
     try:
         dirpath = get_index_dir(index_name)
-        index, metadatas, texts, _ = load_faiss_index(dirpath)
+        index, metadatas, texts, _, _ = load_faiss_index(dirpath)
 
         q_embedding = embedder.embed_query(query)
         q_embedding = normalize_vectors(np.array([q_embedding], dtype=np.float32))
@@ -322,18 +410,25 @@ def search_index(index_name: str, query: str, top_k: int, embedder: OllamaEmbedd
         return []
 
 
+def get_index_metadata(index_name: str) -> Dict:
+    dirpath = get_index_dir(index_name)
+    meta_file = dirpath / "meta.pkl"
+    if not meta_file.exists():
+        return {}
+    with open(meta_file, "rb") as f:
+        data = pickle.load(f)
+    return data
+
+
 def get_index_stats(index_name: str) -> Dict:
     """색인 통계 정보 반환"""
     try:
-        dirpath = get_index_dir(index_name)
-        if not (dirpath / "meta.pkl").exists():
+        data = get_index_metadata(index_name)
+        if not data:
             return {}
 
-        with open(dirpath / "meta.pkl", "rb") as f:
-            data = pickle.load(f)
-
-        metadatas = data["metadatas"]
-        texts = data["texts"]
+        metadatas = data.get("metadatas", [])
+        texts = data.get("texts", [])
 
         sources = set(meta["source"] for meta in metadatas)
         total_chars = sum(len(text) for text in texts)
@@ -345,7 +440,8 @@ def get_index_stats(index_name: str) -> Dict:
             "total_chars": total_chars,
             "avg_chunk_size": avg_chunk_size,
             "sources": list(sources),
-            "dimension": data["dim"],
+            "dimension": data.get("dim", 0),
+            "indexed_at": data.get("indexed_at"),
         }
     except Exception:
         return {}
@@ -435,6 +531,8 @@ def init_session_state():
         st.session_state.llm_config = {}
     if "embedder_config" not in st.session_state:
         st.session_state.embedder_config = {}
+    if "auto_index_running" not in st.session_state:
+        st.session_state.auto_index_running = False
 
 
 def ensure_llm(model_name: str, temperature: float, max_tokens: int, base_url: str):
@@ -456,11 +554,20 @@ def ensure_embedder(model_name: str, base_url: str):
         st.session_state.embedder_config = config
 
 
+def parse_indexed_at(value: str) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except Exception:
+        return None
+
+
 def main():
     init_session_state()
 
-    st.title("🤖 로컬 AI 모델 & PDF RAG 시스템 (Ollama)")
-    st.markdown("*PyPDFLoader 기반 PDF 텍스트 추출, Ollama LLM/임베딩 사용*")
+    st.title("🤖 로컬 AI 모델 & 문서 RAG 시스템 (Ollama)")
+    st.markdown("*PDF/TXT/Office 문서를 인덱싱해 NAS 자료 기반으로 답변 가능*")
     st.caption(f"저장 경로: {APP_DIR}")
     st.markdown("---")
 
@@ -494,7 +601,7 @@ def main():
                     st.warning("Ollama에 연결했지만 모델 목록을 가져오지 못했습니다.")
 
         st.header("📚 RAG 설정")
-        with st.expander("📄 PDF 색인", expanded=False):
+        with st.expander("📄 업로드 색인", expanded=False):
             index_name = st.text_input("색인 이름", "default")
 
             col1, col2 = st.columns(2)
@@ -504,10 +611,10 @@ def main():
                 overlap = st.number_input("오버랩", 0, 500, 200, 50)
 
             uploaded_files = st.file_uploader(
-                "PDF/TXT 파일 업로드",
-                type=["pdf", "txt"],
+                "문서 업로드 (PDF/TXT/DOCX/PPTX/XLSX)",
+                type=["pdf", "txt", "docx", "ppt", "pptx", "xls", "xlsx"],
                 accept_multiple_files=True,
-                help="PDF 또는 TXT 문서를 업로드하여 색인을 생성합니다.",
+                help="문서를 업로드하여 색인을 생성합니다.",
             )
 
             if st.button("🔨 색인 생성") and uploaded_files:
@@ -530,8 +637,10 @@ def main():
                         st.error(f"❌ 색인 생성 실패: {e}")
 
         with st.expander("🏢 NAS 폴더 색인", expanded=False):
-            folder_path = st.text_input("폴더 경로", "")
+            folder_path = st.text_input("폴더 경로", DEFAULT_NAS_PATH)
             include_subfolders = st.checkbox("하위 폴더 포함", value=True)
+            auto_reindex_enabled = st.checkbox("자동 재색인 활성화", value=True)
+            reindex_days = st.number_input("자동 재색인 주기(일)", 1, 365, DEFAULT_REINDEX_DAYS)
             st.caption("NAS 폴더가 이 서버에 마운트되어 있고 읽기 권한이 있어야 합니다.")
 
             if st.button("📂 폴더 색인 생성"):
@@ -577,6 +686,7 @@ def main():
 
             stats = get_index_stats(active_index)
             if stats:
+                indexed_at = stats.get("indexed_at")
                 st.info(
                     f"""
                 📊 **색인 정보: {active_index}**
@@ -584,11 +694,36 @@ def main():
                 - 문서 수: {stats.get('total_sources', 0)}개
                 - 평균 청크 크기: {stats.get('avg_chunk_size', 0):.0f}자
                 - 벡터 차원: {stats.get('dimension', 0)}차원
+                - 마지막 색인 시간: {indexed_at or '정보 없음'}
                 """
                 )
         else:
             st.info("생성된 색인이 없습니다.")
             st.session_state.active_index = None
+
+    if auto_reindex_enabled and folder_path.strip() and Path(folder_path).exists():
+        if not st.session_state.auto_index_running:
+            index_meta = get_index_metadata(index_name)
+            indexed_at = parse_indexed_at(index_meta.get("indexed_at")) if index_meta else None
+            due_time = (indexed_at + timedelta(days=reindex_days)) if indexed_at else None
+            if due_time is None or datetime.utcnow() >= due_time:
+                st.session_state.auto_index_running = True
+                try:
+                    ensure_embedder(embed_model, base_url)
+                    with st.spinner("자동 재색인 진행 중..."):
+                        build_index_from_folder(
+                            index_name,
+                            folder_path,
+                            include_subfolders,
+                            chunk_size,
+                            overlap,
+                            st.session_state.embedder,
+                        )
+                except Exception as e:
+                    st.error(f"자동 재색인 실패: {e}")
+                finally:
+                    st.session_state.auto_index_running = False
+                    st.rerun()
 
     # 메인 영역: 채팅
     st.header("💬 AI 채팅")
